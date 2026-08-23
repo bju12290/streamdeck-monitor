@@ -90,3 +90,9 @@ typings/
 
 # Electron-Forge
 out/
+
+# Native virtual display build/dependency output
+native/virtual-display/.vs/
+native/virtual-display/packages/
+native/virtual-display/**/x64/
+native/virtual-display/**/*.vcxproj.user

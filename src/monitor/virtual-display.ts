@@ -1,17 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { screen } from 'electron';
+import { app, screen } from 'electron';
 
 const IDD_ROOT = path.join(
-  homedir(),
-  'Documents',
-  'dev',
-  'Windows-driver-samples',
-  'video',
-  'IndirectDisplay'
+  app.getAppPath(),
+  'native',
+  'virtual-display'
 );
 
 const IDD_APP_CANDIDATES = [
