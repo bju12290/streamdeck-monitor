@@ -12,6 +12,10 @@ export interface CapturedFrame {
   sequence: number;
 }
 
+const CAPTURE_START_TIMEOUT_MS = 5_000;
+const CAPTURE_ATTEMPT_TIMEOUT_MS = 1_000;
+const CAPTURE_RETRY_DELAY_MS = 100;
+
 export class CaptureSession {
   private ffmpeg: ReturnType<typeof spawn> | null = null;
 
@@ -50,99 +54,58 @@ export class CaptureSession {
       `max_framerate=${fps},` +
       `hwdownload,format=bgra,format=rgb24`;
 
-    const ffmpeg = spawn(
-      'ffmpeg',
-      [
-        '-hide_banner',
-        '-loglevel', 'error',
+    const started =
+      performance.now();
 
-        '-filter_complex', filter,
+    let lastError: Error | null = null;
 
-        '-f', 'rawvideo',
-        '-pix_fmt', 'rgb24',
+    while (
+      performance.now() - started <
+      CAPTURE_START_TIMEOUT_MS
+    ) {
+      this.resetFrames();
 
-        'pipe:1',
-      ],
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }
-    );
-
-    this.ffmpeg = ffmpeg;
-
-    ffmpeg.stdout!.on(
-      'data',
-      (chunk: Buffer) => {
-        this.handleChunk(
-          chunk,
+      try {
+        await this.startAttempt(
+          filter,
           frameSize
         );
-      }
-    );
 
-    ffmpeg.stderr!.on(
-      'data',
-      (data: Buffer) => {
-        console.error(
-          'FFmpeg:',
-          data.toString().trim()
-        );
-      }
-    );
-
-    ffmpeg.on('exit', (code) => {
-      console.log(
-        `FFmpeg exited with code ${code}`
-      );
-
-      if (this.ffmpeg === ffmpeg) {
-        this.ffmpeg = null;
-      }
-    });
-
-    await new Promise<void>(
-      (resolve, reject) => {
-        const handleSpawn = () => {
-          ffmpeg.off(
-            'error',
-            handleError
-          );
-
-          resolve();
-        };
-
-        const handleError = (
-          error: Error
-        ) => {
-          ffmpeg.off(
-            'spawn',
-            handleSpawn
-          );
-
-          this.ffmpeg = null;
-
-          reject(
-            new Error(
-              `Failed to start FFmpeg: ${error.message}`
-            )
-          );
-        };
-
-        ffmpeg.once(
-          'spawn',
-          handleSpawn
+        console.log(
+          `Capture started: monitor ${monitorIndex}, ` +
+          `${width}x${height} @ ${fps} FPS`
         );
 
-        ffmpeg.once(
-          'error',
-          handleError
+        return;
+      } catch (error) {
+        lastError =
+          error instanceof Error
+            ? error
+            : new Error(String(error));
+
+        await this.stopFfmpegProcess();
+
+        if (
+          performance.now() - started >=
+          CAPTURE_START_TIMEOUT_MS
+        ) {
+          break;
+        }
+
+        await delay(
+          CAPTURE_RETRY_DELAY_MS
         );
       }
-    );
+    }
 
-    console.log(
-      `Capture started: monitor ${monitorIndex}, ` +
-      `${width}x${height} @ ${fps} FPS`
+    this.resetFrames();
+
+    throw new Error(
+      `Failed to start capture: ` +
+      (
+        lastError?.message ??
+        'timed out waiting for first frame'
+      )
     );
   }
 
@@ -163,33 +126,7 @@ export class CaptureSession {
   }
 
   async stop(): Promise<void> {
-    const ffmpeg = this.ffmpeg;
-
-    this.ffmpeg = null;
-
-    if (ffmpeg) {
-      if (
-        ffmpeg.exitCode === null &&
-        ffmpeg.signalCode === null
-      ) {
-        const exited =
-          new Promise<void>(
-            (resolve) => {
-              ffmpeg.once(
-                'exit',
-                () => resolve()
-              );
-            }
-          );
-
-        const killed =
-          ffmpeg.kill();
-
-        if (killed) {
-          await exited;
-        }
-      }
-    }
+    await this.stopFfmpegProcess();
 
     this.resetFrames();
 
@@ -198,10 +135,222 @@ export class CaptureSession {
     );
   }
 
+  private async startAttempt(
+    filter: string,
+    frameSize: number
+  ): Promise<void> {
+    const ffmpeg = spawn(
+      'ffmpeg',
+      [
+        '-hide_banner',
+        '-loglevel', 'error',
+
+        '-filter_complex', filter,
+
+        '-f', 'rawvideo',
+        '-pix_fmt', 'rgb24',
+
+        'pipe:1',
+      ],
+      {
+        stdio: [
+          'ignore',
+          'pipe',
+          'pipe',
+        ],
+      }
+    );
+
+    this.ffmpeg = ffmpeg;
+
+    let startupError = '';
+
+    await new Promise<void>(
+      (resolve, reject) => {
+        let settled = false;
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+
+          ffmpeg.off(
+            'error',
+            handleError
+          );
+
+          ffmpeg.off(
+            'exit',
+            handleStartupExit
+          );
+        };
+
+        const succeed = () => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          cleanup();
+
+          resolve();
+        };
+
+        const fail = (
+          error: Error
+        ) => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          cleanup();
+
+          reject(error);
+        };
+
+        const handleError = (
+          error: Error
+        ) => {
+          fail(
+            new Error(
+              `Failed to start FFmpeg: ${error.message}`
+            )
+          );
+        };
+
+        const handleStartupExit = (
+          code: number | null
+        ) => {
+          fail(
+            new Error(
+              startupError ||
+              `FFmpeg exited before first frame ` +
+              `(code ${code})`
+            )
+          );
+        };
+
+        const timeout =
+          setTimeout(
+            () => {
+              fail(
+                new Error(
+                  'Timed out waiting for first captured frame'
+                )
+              );
+            },
+            CAPTURE_ATTEMPT_TIMEOUT_MS
+          );
+
+        ffmpeg.stdout!.on(
+          'data',
+          (chunk: Buffer) => {
+            const completedFrame =
+              this.handleChunk(
+                chunk,
+                frameSize
+              );
+
+            if (completedFrame) {
+              succeed();
+            }
+          }
+        );
+
+        ffmpeg.stderr!.on(
+          'data',
+          (data: Buffer) => {
+            const message =
+              data.toString().trim();
+
+            if (!message) {
+              return;
+            }
+
+            startupError =
+              message;
+
+            console.error(
+              'FFmpeg:',
+              message
+            );
+          }
+        );
+
+        ffmpeg.on(
+          'exit',
+          (code, signal) => {
+            if (code !== null) {
+              console.log(
+                `FFmpeg exited with code ${code}`
+              );
+            } else if (signal) {
+              console.log(
+                `FFmpeg exited from signal ${signal}`
+              );
+            }
+
+            if (
+              this.ffmpeg === ffmpeg
+            ) {
+              this.ffmpeg = null;
+            }
+          }
+        );
+
+        ffmpeg.once(
+          'error',
+          handleError
+        );
+
+        ffmpeg.once(
+          'exit',
+          handleStartupExit
+        );
+      }
+    );
+  }
+
+  private async stopFfmpegProcess(): Promise<void> {
+    const ffmpeg =
+      this.ffmpeg;
+
+    this.ffmpeg = null;
+
+    if (!ffmpeg) {
+      return;
+    }
+
+    if (
+      ffmpeg.exitCode !== null ||
+      ffmpeg.signalCode !== null
+    ) {
+      return;
+    }
+
+    const exited =
+      new Promise<void>(
+        resolve => {
+          ffmpeg.once(
+            'exit',
+            () => resolve()
+          );
+        }
+      );
+
+    const killed =
+      ffmpeg.kill();
+
+    if (killed) {
+      await exited;
+    }
+  }
+
   private handleChunk(
     chunk: Buffer,
     frameSize: number
-  ): void {
+  ): boolean {
+    let completedFrame = false;
+
     this.pending = Buffer.concat([
       this.pending,
       chunk,
@@ -228,7 +377,9 @@ export class CaptureSession {
         Buffer.from(frame);
 
       this.latestSequence++;
+      completedFrame = true;
     }
+    return completedFrame;
   }
 
   private resetFrames(): void {
@@ -236,4 +387,13 @@ export class CaptureSession {
     this.latestFrame = null;
     this.latestSequence = 0;
   }
+}
+
+function delay(
+  ms: number
+): Promise<void> {
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
 }
