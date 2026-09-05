@@ -7,7 +7,7 @@ import {
 } from 'node:net';
 import path from 'node:path';
 
-import { app, screen } from 'electron';
+import { app } from 'electron';
 
 const IDD_ROOT = path.join(
   app.getAppPath(),
@@ -70,26 +70,20 @@ export class VirtualDisplaySession {
 
   private controlSocket: Socket | null = null;
 
-  constructor(
-    private readonly monitorIndex: number
-  ) {}
+  private monitorIndex: number | null = null;
 
-  async start(): Promise<void> {
+  async start(): Promise<number> {
     if (
       this.controlServer ||
       this.controlSocket
     ) {
-      return;
-    }
+      if (this.monitorIndex === null) {
+        throw new Error(
+          'Virtual display is already starting'
+        );
+      }
 
-    const existingDisplays =
-      screen.getAllDisplays().length;
-
-    if (existingDisplays > this.monitorIndex) {
-      throw new Error(
-        `Monitor index ${this.monitorIndex} already exists ` +
-        `before virtual display startup`
-      );
+      return this.monitorIndex;
     }
 
     const iddExecutable =
@@ -144,12 +138,11 @@ export class VirtualDisplaySession {
         'Virtual display helper connected'
       );
 
-      await waitForCondition(
-        () =>
-          screen.getAllDisplays().length >
-          this.monitorIndex,
-        12_000
-      );
+      this.monitorIndex =
+        await waitForReadyMessage(
+          socket,
+          12_000
+        );
     } catch (error) {
       if (
         socket &&
@@ -163,13 +156,22 @@ export class VirtualDisplaySession {
 
       this.controlServer = null;
       this.controlSocket = null;
+      this.monitorIndex = null;
 
       throw error;
+    }
+
+    if (this.monitorIndex === null) {
+      throw new Error(
+        'Virtual display did not provide a monitor index'
+      );
     }
 
     console.log(
       `Virtual display available at monitor ${this.monitorIndex}`
     );
+
+    return this.monitorIndex;
   }
 
   async stop(): Promise<void> {
@@ -203,21 +205,7 @@ export class VirtualDisplaySession {
       server
     );
 
-    try {
-      await waitForCondition(
-        () =>
-          screen.getAllDisplays().length <=
-          this.monitorIndex,
-        5_000
-      );
-    } catch {
-      // PnP removal is asynchronous.
-      // Don't fail the whole stop operation just because
-      // Windows hasn't finished removing the display yet.
-      console.warn(
-        'Virtual display removal is still pending'
-      );
-    }
+    this.monitorIndex = null;
 
     console.log(
       'Virtual display stopped'
@@ -379,6 +367,134 @@ function waitForPipeConnection(
   );
 }
 
+function waitForReadyMessage(
+  socket: Socket,
+  timeoutMs: number
+): Promise<number> {
+  return new Promise(
+    (resolve, reject) => {
+      let pending = '';
+
+      const timeout =
+        setTimeout(
+          () => {
+            cleanup();
+
+            reject(
+              new Error(
+                'Timed out waiting for virtual display readiness'
+              )
+            );
+          },
+          timeoutMs
+        );
+
+      const handleData = (
+        data: Buffer
+      ) => {
+        pending += data.toString();
+
+        const newline =
+          pending.indexOf('\n');
+
+        if (newline === -1) {
+          return;
+        }
+
+        const message =
+          pending
+            .slice(0, newline)
+            .trim();
+
+        const match =
+          /^ready (\d+)$/.exec(
+            message
+          );
+
+        if (!match) {
+          cleanup();
+
+          reject(
+            new Error(
+              `Unexpected virtual display helper message: ${message}`
+            )
+          );
+
+          return;
+        }
+
+        const monitorIndex =
+          Number.parseInt(
+            match[1],
+            10
+          );
+
+        cleanup();
+
+        resolve(
+          monitorIndex
+        );
+      };
+
+      const handleError = (
+        error: Error
+      ) => {
+        cleanup();
+
+        reject(
+          new Error(
+            `Control pipe error: ${error.message}`
+          )
+        );
+      };
+
+      const handleClose = () => {
+        cleanup();
+
+        reject(
+          new Error(
+            'Control pipe closed before virtual display became ready'
+          )
+        );
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+
+        socket.off(
+          'data',
+          handleData
+        );
+
+        socket.off(
+          'error',
+          handleError
+        );
+
+        socket.off(
+          'close',
+          handleClose
+        );
+      };
+
+      socket.on(
+        'data',
+        handleData
+      );
+
+      socket.once(
+        'error',
+        handleError
+      );
+
+      socket.once(
+        'close',
+        handleClose
+      );
+    }
+  );
+}
+
 async function launchElevatedHelper(
   hostExecutable: string,
   iddExecutable: string,
@@ -532,51 +648,5 @@ function closeServer(
         () => resolve()
       );
     }
-  );
-}
-
-async function waitForCondition(
-  condition: () => boolean,
-  timeoutMs: number
-): Promise<void> {
-  const started = performance.now();
-
-  while (
-    performance.now() - started <
-    timeoutMs
-  ) {
-    if (condition()) {
-      return;
-    }
-
-    await delay(100);
-  }
-
-    const displays =
-        screen.getAllDisplays();
-
-    console.error(
-        'Displays visible to Electron:',
-        displays.map(
-            (display, index) => ({
-            index,
-            id: display.id,
-            bounds: display.bounds,
-            size: display.size,
-            })
-        )
-    );
-
-    throw new Error(
-        'Timed out waiting for virtual display'
-    );
-}
-
-function delay(
-  ms: number
-): Promise<void> {
-  return new Promise(
-    resolve =>
-      setTimeout(resolve, ms)
   );
 }

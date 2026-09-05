@@ -9,7 +9,6 @@ import { CaptureSession } from './capture';
 import { VirtualDisplaySession } from './virtual-display';
 
 const CAPTURE_FPS = 60;
-const CAPTURE_MONITOR_INDEX = 3;
 
 export type MonitorStateListener = (
   state: MonitorState
@@ -90,17 +89,15 @@ export class MonitorService {
       const { width, height } = dimensions;
 
       virtualDisplay =
-        new VirtualDisplaySession(
-          CAPTURE_MONITOR_INDEX
-        );
+        new VirtualDisplaySession();
 
-      await virtualDisplay.start();
+      const monitorIndex =
+        await virtualDisplay.start();
 
       capture = new CaptureSession({
         width,
         height,
-        monitorIndex:
-          CAPTURE_MONITOR_INDEX,
+        monitorIndex,
         fps: CAPTURE_FPS,
       });
 

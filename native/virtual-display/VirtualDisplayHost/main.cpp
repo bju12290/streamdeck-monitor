@@ -1,8 +1,183 @@
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <string>
+#include <vector>
+
+struct MonitorEntry
+{
+    std::wstring deviceName;
+};
+
+struct DetectedMonitor
+{
+    int index;
+    std::wstring deviceName;
+};
+
+BOOL CALLBACK collectMonitor(
+    HMONITOR monitor,
+    HDC,
+    LPRECT,
+    LPARAM data
+)
+{
+    auto* monitors =
+        reinterpret_cast<std::vector<MonitorEntry>*>(
+            data
+        );
+
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+
+    if (!GetMonitorInfoW(
+            monitor,
+            &info
+        ))
+    {
+        return TRUE;
+    }
+
+    monitors->push_back({
+        info.szDevice,
+    });
+
+    return TRUE;
+}
+
+std::vector<MonitorEntry> enumerateMonitors()
+{
+    std::vector<MonitorEntry> monitors;
+
+    EnumDisplayMonitors(
+        nullptr,
+        nullptr,
+        collectMonitor,
+        reinterpret_cast<LPARAM>(
+            &monitors
+        )
+    );
+
+    return monitors;
+}
+
+DetectedMonitor findNewMonitor(
+    const std::vector<MonitorEntry>& before
+)
+{
+    const auto after =
+        enumerateMonitors();
+
+    for (
+        std::size_t index = 0;
+        index < after.size();
+        index++
+    )
+    {
+        const auto& candidate =
+            after[index];
+
+        const bool existedBefore =
+            std::any_of(
+                before.begin(),
+                before.end(),
+                [&](const MonitorEntry& existing) {
+                    return existing.deviceName ==
+                        candidate.deviceName;
+                }
+            );
+
+        if (!existedBefore)
+        {
+            return {
+                static_cast<int>(index),
+                candidate.deviceName,
+            };
+        }
+    }
+
+    return {
+        -1,
+        L"",
+    };
+}
+
+DetectedMonitor waitForNewMonitor(
+    const std::vector<MonitorEntry>& before,
+    DWORD timeoutMs
+)
+{
+    const DWORD started =
+        GetTickCount();
+
+    while (
+        GetTickCount() - started <
+        timeoutMs
+    )
+    {
+        const auto monitor =
+            findNewMonitor(
+                before
+            );
+
+        if (monitor.index >= 0)
+        {
+            return monitor;
+        }
+
+        Sleep(100);
+    }
+
+    return {
+        -1,
+        L"",
+    };
+}
+
+bool monitorExists(
+    const std::wstring& deviceName
+)
+{
+    const auto monitors =
+        enumerateMonitors();
+
+    return std::any_of(
+        monitors.begin(),
+        monitors.end(),
+        [&](const MonitorEntry& monitor) {
+            return monitor.deviceName ==
+                deviceName;
+        }
+    );
+}
+
+bool waitForMonitorRemoval(
+    const std::wstring& deviceName,
+    DWORD timeoutMs
+)
+{
+    const DWORD started =
+        GetTickCount();
+
+    while (
+        GetTickCount() - started <
+        timeoutMs
+    )
+    {
+        if (!monitorExists(
+                deviceName
+            ))
+        {
+            return true;
+        }
+
+        Sleep(100);
+    }
+
+    return false;
+}
 
 int wmain(int argc, wchar_t* argv[])
 {
@@ -63,6 +238,9 @@ int wmain(int argc, wchar_t* argv[])
         << L"Starting IddSampleApp: "
         << executablePath
         << L"\n";
+
+    const auto monitorsBefore =
+        enumerateMonitors();
 
     HANDLE job = CreateJobObjectW(
         nullptr,
@@ -175,6 +353,88 @@ int wmain(int argc, wchar_t* argv[])
 
     std::wcout
         << L"IddSampleApp started\n";
+
+    const auto detectedMonitor =
+        waitForNewMonitor(
+            monitorsBefore,
+            12000
+        );
+
+    if (detectedMonitor.index < 0)
+    {
+        std::wcerr
+            << L"Timed out waiting for virtual display\n";
+
+        TerminateJobObject(
+            job,
+            1
+        );
+
+        WaitForSingleObject(
+            processInfo.hProcess,
+            2000
+        );
+
+        CloseHandle(
+            processInfo.hProcess
+        );
+
+        CloseHandle(job);
+        CloseHandle(pipe);
+
+        return 1;
+    }
+
+    std::wcout
+        << L"Virtual display detected at monitor "
+        << detectedMonitor.index
+        << L" ("
+        << detectedMonitor.deviceName
+        << L")\n";
+
+    const std::string readyMessage =
+        "ready " +
+        std::to_string(
+            detectedMonitor.index
+        ) +
+        "\n";
+
+    DWORD bytesWritten = 0;
+
+    if (!WriteFile(
+            pipe,
+            readyMessage.data(),
+            static_cast<DWORD>(
+                readyMessage.size()
+            ),
+            &bytesWritten,
+            nullptr
+        ))
+    {
+        std::wcerr
+            << L"Failed to send virtual display index: "
+            << GetLastError()
+            << L"\n";
+
+        TerminateJobObject(
+            job,
+            1
+        );
+
+        WaitForSingleObject(
+            processInfo.hProcess,
+            2000
+        );
+
+        CloseHandle(
+            processInfo.hProcess
+        );
+
+        CloseHandle(job);
+        CloseHandle(pipe);
+
+        return 1;
+    }
 
     std::string pendingCommand;
 
@@ -303,6 +563,17 @@ int wmain(int argc, wchar_t* argv[])
         processInfo.hProcess,
         2000
     );
+
+    if (!waitForMonitorRemoval(
+            detectedMonitor.deviceName,
+            5000
+        ))
+    {
+        std::wcerr
+            << L"Virtual display removal is still pending: "
+            << detectedMonitor.deviceName
+            << L"\n";
+    }
 
     CloseHandle(
         processInfo.hProcess
