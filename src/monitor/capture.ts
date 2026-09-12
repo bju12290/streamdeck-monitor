@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { app } from 'electron';
+
+import path from 'node:path';
 
 export interface CaptureOptions {
   width: number;
@@ -15,6 +18,19 @@ export interface CapturedFrame {
 const CAPTURE_START_TIMEOUT_MS = 5_000;
 const CAPTURE_ATTEMPT_TIMEOUT_MS = 1_000;
 const CAPTURE_RETRY_DELAY_MS = 100;
+
+const FFMPEG_PATH = app.isPackaged
+  ? path.join(
+      process.resourcesPath,
+      'ffmpeg',
+      'ffmpeg.exe'
+    )
+  : path.join(
+      app.getAppPath(),
+      'resources',
+      'ffmpeg',
+      'ffmpeg.exe'
+    );
 
 export class CaptureSession {
   private ffmpeg: ReturnType<typeof spawn> | null = null;
@@ -140,7 +156,7 @@ export class CaptureSession {
     frameSize: number
   ): Promise<void> {
     const ffmpeg = spawn(
-      'ffmpeg',
+      FFMPEG_PATH,
       [
         '-hide_banner',
         '-loglevel', 'error',
